@@ -5,7 +5,7 @@ from torchvision.datasets.folder import IMG_EXTENSIONS
 from torchvision.transforms import v2
 from utils import MultiRandomChoice
 
-# taken from: https://github.com/open-edge-platform/anomalib/blob/main/src/anomalib/data/utils/generators/perlin.py#L154
+# take from: https://github.com/open-edge-platform/anomalib/blob/main/src/anomalib/data/utils/generators/perlin.py#L154
 
 
 def generate_perlin_noise(
