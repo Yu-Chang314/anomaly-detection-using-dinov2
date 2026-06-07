@@ -1,0 +1,8 @@
+flask
+torch
+torchvision
+numpy
+pillow
+scipy
+timm
+einops
