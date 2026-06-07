@@ -92,13 +92,15 @@ class TransformerBlock(nn.Module):
             num_landmarks,
         )
         self.ffn_norm = nn.RMSNorm(dim)
-        self.ffn_layer = SwiGLUFFN(
-            in_features=dim,
-            hidden_features=dim * 4,
-            out_features=dim,
-            bias=True,
-        )
-        # self.ffn_layer = Mlp(dim, dim * 4, dropout=dropout)
+
+        # self.ffn_layer = SwiGLUFFN(
+        #     in_features=dim,
+        #     hidden_features=dim * 4,
+        #     out_features=dim,
+        #     bias=True,
+        # )
+        self.ffn_layer = Mlp(dim, dim * 4, dropout=dropout)
+        
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
