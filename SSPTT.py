@@ -41,7 +41,8 @@ CONFIG = {
     "epochs": 300,  # Paper IV.B
     "warmup_epochs": 5,
     "batch_size": 4,  # Paper IV.B
-    "lr": 5e-5,  # Paper IV.B (Important: 1e-5 is small, requires stable training)
+    # "lr": 5e-5,  # Paper IV.B (Important: 1e-5 is small, requires stable training)
+    "lr": 1e-5,  # Paper IV.B (Important: 1e-5 is small, requires stable training)
     "mask_ratio": 0.1,  # Paper III.B
     "lambda_mse": 1.0,  # Paper Eq 6
     "device": DEVICE,

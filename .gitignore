@@ -1,0 +1,6 @@
+.env
+/checkpoints
+__pycache__/
+*.py[cod]
+/dataset/
+/datasets/

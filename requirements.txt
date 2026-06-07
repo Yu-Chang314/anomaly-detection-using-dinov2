@@ -1,0 +1,11 @@
+torch
+torchvision
+lightning
+timm
+einops
+numpy
+scipy
+scikit-learn
+matplotlib
+pillow
+flask
