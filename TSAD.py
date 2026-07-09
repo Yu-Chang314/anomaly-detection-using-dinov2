@@ -47,6 +47,9 @@ CONFIG = {
     "warmup_epochs": 5,
     "margin": 1.0,  # target cosine distance on defect patches
     "lambda_anomaly": 1.0,
+    # image score = mean of the top-k anomaly-map pixels (~2% of 224x224);
+    # plain max is destroyed by single false-positive patches on normal images
+    "score_top_k": 1000,
     "anomaly_probability": 0.5,  # chance of injecting a synthetic defect
     "checkpoint_dir": "./checkpoints",
     "num_workers": 4,
@@ -175,7 +178,8 @@ class StudentLightning(L.LightningModule):
             amap = anomaly_maps[sample_idx].float().detach().cpu().numpy()
             amap = gaussian_filter(amap, sigma=4)
 
-            score = float(np.max(amap))
+            top_k = self.config["score_top_k"]
+            score = float(np.sort(amap.flatten())[-top_k:].mean())
             try:
                 image_label = int(labels[sample_idx].item())
             except Exception:
@@ -210,7 +214,7 @@ class StudentLightning(L.LightningModule):
 
             plt.subplot(1, 4, 2)
             plt.imshow(amap, cmap="jet", vmin=0, vmax=1)
-            plt.title(f"Heatmap (Max: {score:.3f})")
+            plt.title(f"Heatmap (Score: {score:.3f})")
             plt.axis("off")
 
             plt.subplot(1, 4, 3)
@@ -393,6 +397,11 @@ if __name__ == "__main__":
         action="store_true",
         help="1-epoch run on a few batches to check the pipeline end-to-end",
     )
+    parser.add_argument(
+        "--eval_only",
+        action="store_true",
+        help="skip training and evaluate cached teacher/student checkpoints",
+    )
     args = parser.parse_args()
 
     config = {**CONFIG, "class_name": args.class_name}
@@ -413,5 +422,14 @@ if __name__ == "__main__":
     os.makedirs(output_path, exist_ok=True)
 
     teacher = distill_teacher(config)
-    student_module = train_student(config, teacher, output_path)
+    if args.eval_only:
+        student_ckpt = os.path.join(
+            config["checkpoint_dir"], f"tsad_student_{config['class_name']}.pth"
+        )
+        student_module = StudentLightning(config, teacher, output_path=output_path)
+        student_module.model.load_state_dict(
+            torch.load(student_ckpt, weights_only=True)
+        )
+    else:
+        student_module = train_student(config, teacher, output_path)
     evaluate(config, student_module)
