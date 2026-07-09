@@ -39,11 +39,14 @@ CONFIG = {
     "tokenizer_name": "dinov2_vitl14_reg",
     "repo_or_dir": "facebookresearch/dinov2",
     # teacher distillation
-    "teacher_width": 384,
+    "teacher_width": 512,
     "teacher_epochs": 200,
     "teacher_lr": 1e-4,
     "teacher_batch_size": 8,
-    # student training
+    # student training (sized for an 8GB GPU, e.g. RTX 5060 laptop)
+    "student_cnn_dim": 512,
+    "student_swin_dim": 128,  # C: stage dims C/2C/4C/8C
+    "student_swin_depth": 4,  # Swin blocks per stage (MSTUnet ablation: 4)
     "student_epochs": 300,
     "student_lr": 1e-4,
     "student_batch_size": 8,
@@ -125,7 +128,12 @@ class StudentLightning(L.LightningModule):
         super().__init__()
         self.config = config
         self.output_path = output_path
-        self.model = StudentNet(out_dim=config["embed_dim"])
+        self.model = StudentNet(
+            out_dim=config["embed_dim"],
+            cnn_dim=config["student_cnn_dim"],
+            swin_embed_dim=config["student_swin_dim"],
+            swin_depth=config["student_swin_depth"],
+        )
         self.teacher = teacher
         self.teacher.eval()
         for param in self.teacher.parameters():

@@ -26,7 +26,7 @@ class TeacherNet(nn.Module):
     inference stays fast.
     """
 
-    def __init__(self, out_dim: int = 1024, width: int = 384) -> None:
+    def __init__(self, out_dim: int = 1024, width: int = 512) -> None:
         super().__init__()
         self.stem = _conv_stem(width)
         self.proj = nn.Conv2d(width, out_dim, kernel_size=1)
@@ -168,8 +168,8 @@ class StudentNet(nn.Module):
     def __init__(
         self,
         out_dim: int = 1024,
-        cnn_dim: int = 384,
-        swin_embed_dim: int = 96,
+        cnn_dim: int = 512,
+        swin_embed_dim: int = 128,
         swin_depth: int = 4,
         window_size: int = 8,
     ) -> None:
