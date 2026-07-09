@@ -1,93 +1,104 @@
 import torch
-from torch import nn
+import torch.nn as nn
 import torch.nn.functional as F
-from subnetworks import ReconstructNetwork, SegmentorNetwork
-from typing import Optional
+from torchvision.models import resnet18, ResNet18_Weights
+from typing import Optional, Tuple
 
-
-class SSPTT(nn.Module):
-    def __init__(
-        self,
-        tokenizer: nn.Module,
-        dim: int,
-        patch_size: int,
-        num_patches: int,
-        mask_ratio: float,
-        num_heads: int,
-        num_layers: int,
-        dropout: float,
-        drop_path_rate: float,
-    ) -> None:
+class StudentTransformerBlock(nn.Module):
+    """
+    自包含的輕量化 Transformer 區塊，免去外部檔案依賴。
+    """
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.0):
         super().__init__()
-        self.tokenizer = tokenizer
-        self.num_patches = num_patches
-        self.mask_ratio = mask_ratio
-
-        self.recon_net = ReconstructNetwork(
-            dim,
-            num_patches,
-            num_heads,
-            num_layers,
-            dropout=dropout,
-            drop_path_rate=drop_path_rate,
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True, dropout=dropout)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim),
+            nn.Dropout(dropout)
         )
 
-        self.segm_net = SegmentorNetwork(
-            input_dim=dim * 2,
-            embed_dim=dim,
-            num_heads=num_heads,
-            num_layers=num_layers,
-            n_cls=2,  # normal, abnormal
-            patch_size=patch_size,
-            dropout=dropout,
-            drop_path_rate=drop_path_rate,
-        )
-
-        self.mask_token = nn.Parameter(torch.randn(dim))
-        nn.init.trunc_normal_(self.mask_token, std=0.02)
-
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {"mask_token"}
-
-    def random_masking(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, _ = x.shape  # batch, sequence length, embedding dim
-        num_masked = int(self.num_patches * self.mask_ratio)
-
-        # Generate random indices per batch
-        rand_indices = torch.randn(B, N, device=x.device).argsort(dim=1)
-        masked_indices = rand_indices[:, :num_masked]  # [B, num_masked]
-
-        mask_tokens = self.mask_token[None, None, :].repeat(
-            B, num_masked, 1
-        )  # [B, num_masked, dim]
-        batch_indices = torch.arange(B, device=x.device).unsqueeze(-1)  # [B, 1]
-
-        x[batch_indices, masked_indices, :] = mask_tokens
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_norm = self.norm1(x)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        x = x + attn_out
+        x = x + self.mlp(self.norm2(x))
         return x
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        clean_x: Optional[torch.Tensor] = None,
-        return_patch_level_masks: bool = True,
-    ) -> torch.Tensor:
+class CNNTransformerStudent(nn.Module):
+    """
+    具備區域感知的 Student 網路：
+    結合 ResNet 前期特徵（強化局部幾何紋理）與 Transformer 區塊（對齊 Teacher 的全局表徵）。
+    """
+    def __init__(self, embed_dim: int = 1024, num_heads: int = 8, num_layers: int = 4, dropout: float = 0.0):
+        super().__init__()
+        # 使用標準 ResNet18 提取豐富的低階與中階局部特徵
+        res = resnet18(weights=ResNet18_Weights.DEFAULT)
+        self.cnn_stem = nn.Sequential(
+            res.conv1, res.bn1, res.relu, res.maxpool,
+            res.layer1,  # 空間解析度 /4
+            res.layer2,  # 空間解析度 /8
+            res.layer3   # 空間解析度 /16 (輸入 224x224 時輸出為 14x14)
+        )
+        
+        # 強制將 CNN 空間尺寸自適應調整為 16x16，完美對齊 DINOv2 的 Token 數量 (16*16=256)
+        self.pool = nn.AdaptiveAvgPool2d((16, 16))
+        self.proj = nn.Linear(256, embed_dim)  # ResNet18 layer3 的 Channel 是 256
+        
+        # 可學習的位置編碼
+        self.pos_embed = nn.Parameter(torch.zeros(1, 256, embed_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        
+        # 輕量化 Transformer 堆疊
+        self.blocks = nn.ModuleList([
+            StudentTransformerBlock(dim=embed_dim, num_heads=num_heads, dropout=dropout)
+            for _ in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
 
-        with torch.no_grad():
-            x_tokens = self.tokenizer(x)
-            recon_tokens = x_tokens.clone().detach()
-            if self.training:
-                clean_tokens = self.tokenizer(clean_x) if clean_x is not None else None
-                recon_tokens = self.random_masking(recon_tokens)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.cnn_stem(x)              # 輸出尺寸: [B, 256, 14, 14]
+        x = self.pool(x)                  # 修正尺寸: [B, 256, 16, 16]
+        x = x.flatten(2).transpose(1, 2)  # 展平排列: [B, 256, 256]
+        x = self.proj(x)                  # 維度映射: [B, 256, 1024]
+        x = x + self.pos_embed
+        
+        for blk in self.blocks:
+            x = blk(x)
+        return self.norm(x)
 
-        recon_tokens = self.recon_net(recon_tokens)
-        segm_cat = torch.cat((recon_tokens, x_tokens), dim=-1)  # [B, N, 2*D]
-        masks = self.segm_net(segm_cat, im_size=x.shape[2:])
+class TeacherStudentNet(nn.Module):
+    """
+    完整的不一致性偵測雙軌網路（Teacher-Student Network）
+    """
+    def __init__(self, tokenizer: nn.Module, embed_dim: int, num_heads: int, num_layers: int, dropout: float):
+        super().__init__()
+        self.teacher = tokenizer
+        # 鐵面考官：嚴格凍結 Teacher 權重，不參與梯度更新
+        self.teacher.eval()
+        for param in self.teacher.parameters():
+            param.requires_grad = False
+            
+        self.student = CNNTransformerStudent(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dropout=dropout
+        )
 
-        if not return_patch_level_masks:
-            masks = F.interpolate(masks, size=x.shape[2:], mode="bilinear")
-
+    def forward(self, x: torch.Tensor, clean_x: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.training:
-            return masks, recon_tokens, clean_tokens
+            # 訓練階段：Teacher 唯讀最純淨的原始圖；Student 觀察被擾動污染的增強圖
+            with torch.no_grad():
+                teacher_feats = self.teacher(clean_x if clean_x is not None else x)
+            student_feats = self.student(x)
+            return student_feats, teacher_feats
         else:
-            return masks
+            # 推論階段：雙軌同圖輸入，兩者吃完全同一張待測影像
+            with torch.no_grad():
+                teacher_feats = self.teacher(x)
+            student_feats = self.student(x)
+            return student_feats, teacher_feats
