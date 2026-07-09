@@ -1,4 +1,5 @@
 import argparse
+import gc
 import os
 import warnings
 
@@ -13,9 +14,11 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 import lightning as L
 
+import torchvision.transforms.v2 as v2
+
 from SSPTT import DINOWrapper, denormalize
 from anomaly_types.cutpaste import CutPasteNormal, CutPasteScar
-from anomaly_types.nsa import NSAAnomalyGenerator
+from anomaly_types.nsa import NSAAnomalyGenerator, TEXTURES
 from anomaly_types.perlin import PerlinAnomalyGenerator
 from mvtec import MVTecDataset
 from teacher_student import StudentNet, TeacherNet
@@ -66,6 +69,15 @@ torch.set_float32_matmul_precision("high")
 def seed_numpy_worker(_: int) -> None:
     # NSA's patch_ex uses numpy RNG, which is not reseeded per worker by default
     np.random.seed(torch.utils.data.get_worker_info().seed % 2**32)
+
+
+def train_augment(class_name: str) -> v2.Transform | None:
+    """Geometric augmentation of normal training images. Textures have natural
+    variation that the fixed resize+center-crop pipeline never shows the
+    student, causing global divergence on slightly different test normals."""
+    if class_name in TEXTURES:
+        return v2.Compose([v2.RandomVerticalFlip(), v2.RandomHorizontalFlip()])
+    return None
 
 
 # ==========================================
@@ -317,7 +329,9 @@ def distill_teacher(config: dict) -> TeacherNet:
         return teacher
 
     print(f"\n{'=' * 50}\n  Phase 1: distilling teacher ({class_name})\n{'=' * 50}")
-    train_ds = MVTecDataset(DATA_ROOT, class_name, phase="train")
+    train_ds = MVTecDataset(
+        DATA_ROOT, class_name, phase="train", augment=train_augment(class_name)
+    )
     train_loader = make_loader(
         config, train_ds, config["teacher_batch_size"], shuffle=True
     )
@@ -331,7 +345,15 @@ def distill_teacher(config: dict) -> TeacherNet:
     os.makedirs(config["checkpoint_dir"], exist_ok=True)
     torch.save(lit_module.model.state_dict(), ckpt_path)
     print(f"[TEACHER] Saved to {ckpt_path}")
-    return lit_module.model
+
+    # Free DINOv2, the trainer, and the dataloader workers before the student
+    # phase spawns its own workers; the brief overlap can exhaust system RAM.
+    teacher = lit_module.model
+    del lit_module, trainer, train_loader
+    gc.collect()
+    if USE_CUDA:
+        torch.cuda.empty_cache()
+    return teacher
 
 
 def train_student(config: dict, teacher: TeacherNet, output_path: str) -> StudentLightning:
@@ -342,6 +364,7 @@ def train_student(config: dict, teacher: TeacherNet, output_path: str) -> Studen
         DATA_ROOT,
         class_name,
         phase="train",
+        augment=train_augment(class_name),
         anomaly_generators=[
             NSAAnomalyGenerator(
                 class_name,
