@@ -53,7 +53,7 @@ CONFIG = {
     # image score = mean of the top-k anomaly-map pixels (~2% of 224x224);
     # plain max is destroyed by single false-positive patches on normal images
     "score_top_k": 1000,
-    "anomaly_probability": 0.5,  # chance of injecting a synthetic defect
+    "anomaly_probability": 1.0,  # chance of injecting a synthetic defect
     "checkpoint_dir": "./checkpoints",
     "num_workers": 4,
     "precision": "bf16-mixed",
