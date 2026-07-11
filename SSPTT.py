@@ -33,7 +33,7 @@ CONFIG = {
     "seed": 42,
     "img_size": 224,
     "patch_size": 14,
-    "class_name": "pill",
+    "class_name": "transistor",
     "embed_dim": 1024,  # ViT-B對齊
     "num_heads": 8,
     "num_layers": 4,
@@ -136,26 +136,26 @@ class SSPTTLightning(L.LightningModule):
         self.image_labels: list[int] = []
         self.pixel_scores_all: list[float] = []
         self.pixel_labels_all: list[int] = []
+        # 新增：用來動態計算最佳全域門檻的容器
+        self.all_predicted_maps: list[np.ndarray] = []
+        self.all_gt_masks: list[np.ndarray] = []
+        self.all_metadata: list[dict] = []
         os.makedirs(self.output_path, exist_ok=True)
 
     def predict_step(self, batch, batch_idx: int):
         images, labels, masks, paths = batch
         
-        # 線上推論：兩者吃完全相同的圖
         student_tokens, teacher_tokens = self(images)
+        dist_map = torch.norm(teacher_tokens - student_tokens, p=2, dim=-1)
+        dist_map = dist_map.view(-1, 16, 16).unsqueeze(1)
         
-        # 計算特徵失配距離圖
-        dist_map = torch.norm(teacher_tokens - student_tokens, p=2, dim=-1)  # [B, 256]
-        dist_map = dist_map.view(-1, 16, 16).unsqueeze(1)                   # [B, 1, 16, 16]
-        
-        # 將 16x16 的粗糙特徵距離地圖，雙線性內插回 224x224 原始解析度
         anomaly_maps = F.interpolate(dist_map, size=images.shape[2:], mode="bilinear", align_corners=False).squeeze(1)
 
         for sample_idx in range(images.size(0)):
             probs = anomaly_maps[sample_idx].detach().cpu().numpy()
-            probs = gaussian_filter(probs, sigma=4)  # 平滑熱圖以降低雜訊
+            probs = gaussian_filter(probs, sigma=4)
 
-            # 影像級評分：取高亮熱圖中最高的前 1% 異常像素均值，比單純取 max 更穩健
+            # 影像級評分：取最高的前 1% 異常像素均值
             top_k_pixels = int(probs.size * 0.01)
             patch_score = float(np.mean(np.sort(probs.flatten())[-top_k_pixels:]))
 
@@ -172,34 +172,16 @@ class SSPTTLightning(L.LightningModule):
             self.pixel_scores_all.extend(probs.flatten().tolist())
             self.pixel_labels_all.extend(mask_bin.flatten().tolist())
 
-            path = paths[sample_idx]
-            defect_type = os.path.basename(os.path.dirname(path))
-            plt.figure(figsize=(20, 5))
-
-            plt.subplot(1, 4, 1)
-            plt.imshow(np.clip(denormalize(images[sample_idx]).detach().cpu().permute(1, 2, 0).numpy(), 0, 1))
-            plt.title(f"{defect_type}")
-            plt.axis("off")
-
-            # 繪製真實工業級熱圖
-            plt.subplot(1, 4, 2)
-            plt.imshow(probs, cmap="jet")
-            plt.title(f"Anomaly Map (Score: {patch_score:.3f})")
-            plt.axis("off")
-
-            plt.subplot(1, 4, 3)
-            plt.imshow(mask_np, cmap="gray")
-            plt.title("GT")
-            plt.axis("off")
-
-            # 動態自適應可視化分割門檻
-            plt.subplot(1, 4, 4)
-            plt.imshow(probs > (self.config["margin"] * 0.5), cmap="gray")
-            plt.title("Predicted Mask")
-            plt.axis("off")
-
-            plt.savefig(os.path.join(self.output_path, f"{defect_type}_{batch_idx + sample_idx:03d}.png"))
-            plt.close()
+            # 暫存起來，等整批測試完，拿到全域門檻後再一起畫圖
+            self.all_predicted_maps.append(probs)
+            self.all_gt_masks.append(mask_np)
+            self.all_metadata.append({
+                "image": images[sample_idx].cpu(),
+                "path": paths[sample_idx],
+                "patch_score": patch_score,
+                "batch_idx": batch_idx,
+                "sample_idx": sample_idx
+            })
 
     def on_predict_epoch_end(self) -> None:
         try:
@@ -207,14 +189,62 @@ class SSPTTLightning(L.LightningModule):
             p_auroc = roc_auc_score(self.pixel_labels_all, self.pixel_scores_all)
         except Exception as error:
             warnings.warn(f"AUROC calculation failed: {error}")
-            i_auroc = float("nan")
-            p_auroc = float("nan")
+            i_auroc, p_auroc = float("nan"), float("nan")
 
         print(f"\n[SUMMARY] I-AUROC: {i_auroc:.4f} | P-AUROC: {p_auroc:.4f}")
+
+        # --- 核心改動：利用全域正常樣本的分數，找出絕對的黃金分割門檻 ---
+        # 找出所有被標記為「正常 (0)」的圖片的最高像素分數
+        normal_scores = [
+            np.max(self.all_predicted_maps[i]) 
+            for i, label in enumerate(self.image_labels) if label == 0
+        ]
+        
+        if len(normal_scores) > 0:
+            # 絕對門檻設在正常樣本中最高分數的 95% 分位數（稍微容忍雜訊，但絕不亂報警）
+            global_thresh = float(np.percentile(normal_scores, 95))
+        else:
+            # 如果沒有正常樣本當對照組，則取全局分數的 98%
+            global_thresh = float(np.percentile(self.pixel_scores_all, 98))
+            
+        print(f"[THRES] Calculated Global Absolute Threshold: {global_thresh:.4f}")
+
+        # --- 統一繪圖輸出 ---
+        for i, meta in enumerate(self.all_metadata):
+            probs = self.all_predicted_maps[i]
+            mask_np = self.all_gt_masks[i]
+            path = meta["path"]
+            defect_type = os.path.basename(os.path.dirname(path))
+            
+            plt.figure(figsize=(20, 5))
+            plt.subplot(1, 4, 1)
+            plt.imshow(np.clip(denormalize(meta["image"]).permute(1, 2, 0).numpy(), 0, 1))
+            plt.title(f"{defect_type}")
+            plt.axis("off")
+
+            plt.subplot(1, 4, 2)
+            plt.imshow(probs, cmap="jet")
+            plt.title(f"Anomaly Map (Score: {meta['patch_score']:.3f})")
+            plt.axis("off")
+
+            plt.subplot(1, 4, 3)
+            plt.imshow(mask_np, cmap="gray")
+            plt.title("GT")
+            plt.axis("off")
+
+            # 使用全域絕對門檻！正常圖低於此門檻就會是乾淨的「全黑」，異常圖才會「顯影」
+            plt.subplot(1, 4, 4)
+            plt.imshow(probs > global_thresh, cmap="gray")
+            plt.title("Predicted Mask (Global Thresh)")
+            plt.axis("off")
+
+            plt.savefig(os.path.join(self.output_path, f"{defect_type}_{meta['batch_idx'] + meta['sample_idx']:03d}.png"))
+            plt.close()
 
         with open(os.path.join(self.output_path, "metrics.txt"), "w") as f:
             f.write(f"I-AUROC: {i_auroc}\n")
             f.write(f"P-AUROC: {p_auroc}\n")
+            f.write(f"Global_Threshold: {global_thresh}\n")
 
     def configure_optimizers(self):
         optimizer = AdamW(
@@ -262,7 +292,7 @@ def run_one_margin(margin: float, config: dict) -> dict:
     CLASS_NAME = config["class_name"]
     DATA_ROOT = "D:/Users/peggy/Dataset/mvtec_anomaly_detection"
     DTD_ROOT = "D:/Users/peggy/Dataset/dtd/images"
-    OUTPUT_PATH = f"./results/{CLASS_NAME}/{CLASS_NAME}_margin_{margin:.1f}"
+    OUTPUT_PATH = f"./results/TS_{CLASS_NAME}/{CLASS_NAME}_margin_{margin:.1f}"
     CKPT_DIR = config["checkpoint_dir"]
 
     os.makedirs(OUTPUT_PATH, exist_ok=True)
