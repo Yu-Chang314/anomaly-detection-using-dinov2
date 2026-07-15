@@ -2,37 +2,90 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.swin_transformer import PatchMerging, SwinTransformerBlock
+from timm.models.vision_transformer import Block as ViTBlock
+
+from pos_embed import get_2d_sincos_pos_embed
 
 
-def _conv_stem(out_dim: int) -> nn.Sequential:
-    """Small CNN mapping a 224x224 image to a 16x16 feature map (stride 14)."""
-    return nn.Sequential(
-        nn.Conv2d(3, out_dim // 4, kernel_size=7, stride=7),  # 224 -> 32
-        nn.GELU(),
-        nn.Conv2d(out_dim // 4, out_dim // 2, kernel_size=3, padding=1),
-        nn.GELU(),
-        nn.Conv2d(out_dim // 2, out_dim, kernel_size=3, stride=2, padding=1),  # 32 -> 16
-        nn.GELU(),
-        nn.Conv2d(out_dim, out_dim, kernel_size=3, padding=1),
-        nn.GELU(),
-    )
+class ResidualBlock(nn.Module):
+    """Pre-activation 3x3-3x3 residual conv block."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.norm1 = nn.GroupNorm(8, dim)
+        self.conv1 = nn.Conv2d(dim, dim, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(8, dim)
+        self.conv2 = nn.Conv2d(dim, dim, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(F.gelu(self.norm1(x)))
+        h = self.conv2(F.gelu(self.norm2(h)))
+        return x + h
+
+
+class ConvEncoder(nn.Module):
+    """CNN mapping a 224x224 image to a 16x16 feature map (stride 14),
+    with `depth` residual blocks at each of the 32x32 and 16x16 scales."""
+
+    def __init__(self, out_dim: int, depth: int = 2) -> None:
+        super().__init__()
+        half = out_dim // 2
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, half, kernel_size=7, stride=7),  # 224 -> 32
+            nn.GELU(),
+            nn.Conv2d(half, half, kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+        self.stage1 = nn.Sequential(*[ResidualBlock(half) for _ in range(depth)])
+        self.down = nn.Conv2d(half, out_dim, kernel_size=3, stride=2, padding=1)  # 32 -> 16
+        self.stage2 = nn.Sequential(*[ResidualBlock(out_dim) for _ in range(depth)])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.stage2(self.down(self.stage1(self.stem(x))))
 
 
 class TeacherNet(nn.Module):
-    """Compact CNN distilled to regress DINOv2 patch tokens.
+    """Compact CNN + global-attention hybrid distilled to regress DINOv2
+    patch tokens.
+
+    DINOv2 patch tokens carry global context (every token attends to the
+    whole image), so a local-receptive-field CNN alone has an irreducible
+    regression error; a few ViT blocks over the 16x16 grid supply that
+    global mixing while keeping inference fast (256 tokens only).
 
     Output: [B, out_dim, 16, 16] for a 224x224 input, matching the
-    16x16 token grid of DINOv2 ViT-L/14. Kept deliberately small so
-    inference stays fast.
+    16x16 token grid of DINOv2 ViT-L/14.
     """
 
-    def __init__(self, out_dim: int = 1024, width: int = 512) -> None:
+    def __init__(
+        self,
+        out_dim: int = 1024,
+        width: int = 512,
+        conv_depth: int = 2,
+        attn_depth: int = 4,
+        num_heads: int = 8,
+        grid_size: int = 16,
+    ) -> None:
         super().__init__()
-        self.stem = _conv_stem(width)
-        self.proj = nn.Conv2d(width, out_dim, kernel_size=1)
+        self.encoder = ConvEncoder(width, depth=conv_depth)
+        pos = get_2d_sincos_pos_embed(width, grid_size)
+        self.register_buffer(
+            "pos_embed", torch.from_numpy(pos).float().unsqueeze(0)
+        )
+        self.blocks = nn.ModuleList(
+            [ViTBlock(dim=width, num_heads=num_heads) for _ in range(attn_depth)]
+        )
+        self.norm = nn.LayerNorm(width)
+        self.proj = nn.Linear(width, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(self.stem(x))
+        feat = self.encoder(x)  # [B, width, 16, 16]
+        b, _, h, w = feat.shape
+        tokens = feat.flatten(2).transpose(1, 2) + self.pos_embed
+        for blk in self.blocks:
+            tokens = blk(tokens)
+        tokens = self.proj(self.norm(tokens))
+        return tokens.transpose(1, 2).reshape(b, -1, h, w)
 
 
 class PatchPartition(nn.Module):
@@ -169,12 +222,13 @@ class StudentNet(nn.Module):
         self,
         out_dim: int = 1024,
         cnn_dim: int = 512,
+        cnn_depth: int = 2,
         swin_embed_dim: int = 128,
         swin_depth: int = 4,
         window_size: int = 8,
     ) -> None:
         super().__init__()
-        self.cnn = _conv_stem(cnn_dim)
+        self.cnn = ConvEncoder(cnn_dim, depth=cnn_depth)
         self.swin = SwinUNetBranch(swin_embed_dim, swin_depth, window_size)
 
         self.fuse = nn.Sequential(

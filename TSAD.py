@@ -2,6 +2,7 @@ import argparse
 import gc
 import os
 import warnings
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -34,36 +35,40 @@ CONFIG = {
     "seed": 42,
     "img_size": 224,
     "patch_size": 14,  # DINOv2 ViT-L/14 -> 16x16 token grid
-    "class_name": "grid",
+    "class_name": "carpet",
     "embed_dim": 1024,
     "tokenizer_name": "dinov2_vitl14_reg",
     "repo_or_dir": "facebookresearch/dinov2",
-    # teacher distillation
+    # teacher distillation (CNN + global-attention hybrid, ~27M params)
     "teacher_width": 512,
+    "teacher_conv_depth": 2,  # residual blocks per CNN scale (32x32 and 16x16)
+    "teacher_attn_depth": 4,  # ViT blocks over the 16x16 token grid
+    "teacher_heads": 8,
     "teacher_epochs": 200,
     "teacher_lr": 1e-4,
     "teacher_batch_size": 8,
     # student training (sized for an 8GB GPU, e.g. RTX 5060 laptop)
     "student_cnn_dim": 512,
+    "student_cnn_depth": 2,  # residual blocks per CNN scale
     "student_swin_dim": 128,  # C: stage dims C/2C/4C/8C
     "student_swin_depth": 4,  # Swin blocks per stage (MSTUnet ablation: 4)
     "student_epochs": 300,
     "student_lr": 1e-4,
     "student_batch_size": 8,
     "warmup_epochs": 5,
-    "margin": 1.0,  # target cosine distance on defect patches
-    "lambda_anomaly": 1.0,
     # image score = mean of the top-k anomaly-map pixels (~2% of 224x224);
     # plain max is destroyed by single false-positive patches on normal images
     "score_top_k": 1000,
     "anomaly_probability": 1.0,  # chance of injecting a synthetic defect
-    "checkpoint_dir": "./checkpoints",
+    "checkpoint_dir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints"),
     "num_workers": 4,
     "precision": "bf16-mixed",
 }
 
-DATA_ROOT = "./dataset/mvtec_anomaly_detection"
-DTD_ROOT = "./datasets/dtd/dtd/images"
+# Anchor all paths to this file so the script works from any working directory
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+DATA_ROOT = os.path.join(REPO_ROOT, "dataset", "mvtec_anomaly_detection")
+DTD_ROOT = os.path.join(REPO_ROOT, "datasets", "dtd", "dtd", "images")
 
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision("high")
@@ -83,6 +88,27 @@ def train_augment(class_name: str) -> v2.Transform | None:
     return None
 
 
+def make_anomaly_generators(config: dict) -> list:
+    """The four synthetic-defect generators (NSA / Perlin+DTD / CutPaste x2),
+    shared by teacher distillation and student training."""
+    class_name = config["class_name"]
+    p = config["anomaly_probability"]
+    return [
+        NSAAnomalyGenerator(
+            class_name,
+            source_dir=os.path.join(DATA_ROOT, class_name, "train", "good"),
+            probability=p,
+        ),
+        PerlinAnomalyGenerator(
+            anomaly_source_path=DTD_ROOT,
+            probability=p,
+            blend_factor=(0.1, 1.0),
+        ),
+        CutPasteNormal(probability=p),
+        CutPasteScar(probability=p, length_range=(10, 224)),
+    ]
+
+
 # ==========================================
 # 1. Teacher distillation (fit DINOv2 features)
 # ==========================================
@@ -91,7 +117,11 @@ class TeacherDistillLightning(L.LightningModule):
         super().__init__()
         self.config = config
         self.model = TeacherNet(
-            out_dim=config["embed_dim"], width=config["teacher_width"]
+            out_dim=config["embed_dim"],
+            width=config["teacher_width"],
+            conv_depth=config["teacher_conv_depth"],
+            attn_depth=config["teacher_attn_depth"],
+            num_heads=config["teacher_heads"],
         )
         self.dino = DINOWrapper(config["repo_or_dir"], config["tokenizer_name"])
         self.grid_size = config["img_size"] // config["patch_size"]
@@ -102,11 +132,16 @@ class TeacherDistillLightning(L.LightningModule):
         return tokens.transpose(1, 2).reshape(b, d, self.grid_size, self.grid_size)
 
     def training_step(self, batch, _) -> torch.Tensor:
-        clean_images, _, _, _ = batch
-        target = self.dino_feature_map(clean_images)
-        pred = self.model(clean_images)
+        # Distill on defect-injected images as well (p=anomaly_probability):
+        # the student phase evaluates the teacher on synthetic defects, so its
+        # features there must be well-defined, not out-of-distribution noise.
+        _, augmented_images, _, _ = batch
+        target = self.dino_feature_map(augmented_images)
+        pred = self.model(augmented_images)
         loss = F.mse_loss(pred, target)
-        self.log("distill loss", loss, prog_bar=True, batch_size=clean_images.size(0))
+        self.log(
+            "distill loss", loss, prog_bar=True, batch_size=augmented_images.size(0)
+        )
         return loss
 
     def configure_optimizers(self):
@@ -121,7 +156,7 @@ class TeacherDistillLightning(L.LightningModule):
 
 
 # ==========================================
-# 2. Student training (mimic teacher on normal, diverge on defects)
+# 2. Student training (denoising: reproduce the teacher's clean-image features)
 # ==========================================
 class StudentLightning(L.LightningModule):
     def __init__(self, config: dict, teacher: TeacherNet, output_path: str) -> None:
@@ -131,6 +166,7 @@ class StudentLightning(L.LightningModule):
         self.model = StudentNet(
             out_dim=config["embed_dim"],
             cnn_dim=config["student_cnn_dim"],
+            cnn_depth=config["student_cnn_depth"],
             swin_embed_dim=config["student_swin_dim"],
             swin_depth=config["student_swin_depth"],
         )
@@ -147,36 +183,18 @@ class StudentLightning(L.LightningModule):
         return 1.0 - (t * s).sum(dim=1)
 
     def training_step(self, batch, _) -> torch.Tensor:
-        _, augmented_images, masks, _ = batch
+        # Denoising objective: the student sees the defect-injected image but
+        # must reproduce the teacher's features for the clean image. Real
+        # defects at test time cannot be "repaired", so teacher and student
+        # diverge there without needing a hinge on synthetic patches.
+        clean_images, augmented_images, _, _ = batch
 
-        patch_mask = (
-            F.max_pool2d(
-                masks,
-                kernel_size=self.config["patch_size"],
-                stride=self.config["patch_size"],
-            ).squeeze(1)
-            > 0.5
-        )
+        with torch.no_grad():
+            target = F.normalize(self.teacher(clean_images), dim=1)
+        pred = F.normalize(self.model(augmented_images), dim=1)
+        loss = (1.0 - (pred * target).sum(dim=1)).mean()
 
-        distance = self.feature_distance(augmented_images)
-
-        normal_d = distance[~patch_mask]
-        anomaly_d = distance[patch_mask]
-
-        loss_normal = (
-            normal_d.mean() if normal_d.numel() > 0 else distance.sum() * 0.0
-        )
-        loss_anomaly = (
-            F.relu(self.config["margin"] - anomaly_d).mean()
-            if anomaly_d.numel() > 0
-            else distance.sum() * 0.0
-        )
-        loss = loss_normal + self.config["lambda_anomaly"] * loss_anomaly
-
-        bs = augmented_images.size(0)
-        self.log("loss", loss, prog_bar=True, batch_size=bs)
-        self.log("normal loss", loss_normal, prog_bar=True, batch_size=bs)
-        self.log("anomaly loss", loss_anomaly, prog_bar=True, batch_size=bs)
+        self.log("loss", loss, prog_bar=True, batch_size=clean_images.size(0))
         return loss
 
     def on_predict_start(self) -> None:
@@ -331,14 +349,22 @@ def distill_teacher(config: dict) -> TeacherNet:
     if os.path.exists(ckpt_path):
         print(f"[TEACHER] Loading cached teacher from {ckpt_path}")
         teacher = TeacherNet(
-            out_dim=config["embed_dim"], width=config["teacher_width"]
+            out_dim=config["embed_dim"],
+            width=config["teacher_width"],
+            conv_depth=config["teacher_conv_depth"],
+            attn_depth=config["teacher_attn_depth"],
+            num_heads=config["teacher_heads"],
         )
         teacher.load_state_dict(torch.load(ckpt_path, weights_only=True))
         return teacher
 
     print(f"\n{'=' * 50}\n  Phase 1: distilling teacher ({class_name})\n{'=' * 50}")
     train_ds = MVTecDataset(
-        DATA_ROOT, class_name, phase="train", augment=train_augment(class_name)
+        DATA_ROOT,
+        class_name,
+        phase="train",
+        augment=train_augment(class_name),
+        anomaly_generators=make_anomaly_generators(config),
     )
     train_loader = make_loader(
         config, train_ds, config["teacher_batch_size"], shuffle=True
@@ -366,27 +392,13 @@ def distill_teacher(config: dict) -> TeacherNet:
 
 def train_student(config: dict, teacher: TeacherNet, output_path: str) -> StudentLightning:
     class_name = config["class_name"]
-    p = config["anomaly_probability"]
 
     train_ds = MVTecDataset(
         DATA_ROOT,
         class_name,
         phase="train",
         augment=train_augment(class_name),
-        anomaly_generators=[
-            NSAAnomalyGenerator(
-                class_name,
-                source_dir=os.path.join(DATA_ROOT, class_name, "train", "good"),
-                probability=p,
-            ),
-            PerlinAnomalyGenerator(
-                anomaly_source_path=DTD_ROOT,
-                probability=p,
-                blend_factor=(0.1, 1.0),
-            ),
-            CutPasteNormal(probability=p),
-            CutPasteScar(probability=p, length_range=(10, 224)),
-        ],
+        anomaly_generators=make_anomaly_generators(config),
     )
     train_loader = make_loader(
         config, train_ds, config["student_batch_size"], shuffle=True
@@ -405,6 +417,8 @@ def train_student(config: dict, teacher: TeacherNet, output_path: str) -> Studen
     os.makedirs(config["checkpoint_dir"], exist_ok=True)
     torch.save(lit_module.model.state_dict(), ckpt_path)
     print(f"[STUDENT] Saved to {ckpt_path}")
+    # Per-run copy: later runs overwrite ckpt_path but never this one
+    torch.save(lit_module.model.state_dict(), os.path.join(output_path, "student.pth"))
     return lit_module
 
 
@@ -433,9 +447,19 @@ if __name__ == "__main__":
         action="store_true",
         help="skip training and evaluate cached teacher/student checkpoints",
     )
+    parser.add_argument(
+        "--anomaly_probability",
+        type=float,
+        default=CONFIG["anomaly_probability"],
+        help="chance of injecting a synthetic defect during student training",
+    )
     args = parser.parse_args()
 
-    config = {**CONFIG, "class_name": args.class_name}
+    config = {
+        **CONFIG,
+        "class_name": args.class_name,
+        "anomaly_probability": args.anomaly_probability,
+    }
     if args.smoke:
         config.update(
             {
@@ -449,7 +473,10 @@ if __name__ == "__main__":
 
     L.seed_everything(config["seed"], workers=True)
 
-    output_path = f"./results/{config['class_name']}_tsad"
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = os.path.join(
+        REPO_ROOT, "results", f"{config['class_name']}_tsad_{run_id}"
+    )
     os.makedirs(output_path, exist_ok=True)
 
     teacher = distill_teacher(config)
