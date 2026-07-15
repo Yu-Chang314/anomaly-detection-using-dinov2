@@ -6,6 +6,8 @@ einops
 numpy
 scipy
 scikit-learn
+scikit-image
+opencv-python
 matplotlib
 pillow
 flask

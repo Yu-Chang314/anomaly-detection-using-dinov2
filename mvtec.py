@@ -19,10 +19,12 @@ class MVTecDataset(Dataset):
         mean: list[float] = [0.485, 0.456, 0.406],
         std: list[float] = [0.229, 0.224, 0.225],
         anomaly_generators: list[v2.Transform] | None = None,
+        augment: v2.Transform | None = None,
     ) -> None:
         self.resize = resize
         self.cropsize = cropsize
         self.phase = phase
+        self.augment = augment
 
         if anomaly_generators is not None:
             self.augmenter = MultiRandomChoice(
@@ -98,6 +100,8 @@ class MVTecDataset(Dataset):
     ) -> tuple[torch.Tensor, torch.Tensor | int, torch.Tensor, str]:
         image = self.transform_x(Image.open(self.x[idx]).convert("RGB"))
         if self.phase == "train":
+            if self.augment is not None:
+                image = self.augment(image)
             if self.augmenter is not None:
                 augmented_image, mask = self.augmenter(image)
             else:
