@@ -40,8 +40,8 @@ CONFIG = {
     "epochs": 300,
     "warmup_epochs": 5,
     "batch_size": 4,
-    "lr": 1e-4,         # T-S 架構通常需要略微明快的學習率
-    "margin": 1.0,      # 特徵失配的基準邊界距離
+    "lr": 2e-4,         # T-S 架構通常需要略微明快的學習率
+    "margin": 0.5,      # 特徵失配的基準邊界距離
     "device": DEVICE,
     "checkpoint_dir": "./checkpoints",
     "dropout": 0.0,
@@ -108,18 +108,18 @@ class SSPTTLightning(L.LightningModule):
         # 前向傳播
         student_tokens, teacher_tokens = self(augmented_images, clean_x=clean_images)
 
-        # 計算每一個 Token 的 L2 特徵空間距離
-        dist_map = torch.norm(teacher_tokens - student_tokens, p=2, dim=-1)  # [B, 256]
-        dist_map = dist_map.view(-1, 16, 16)                                 # [B, 16, 16]
+        # === 核心修改：訓練也統一改用餘弦距離 ===
+        cos_sim = F.cosine_similarity(student_tokens, teacher_tokens, dim=-1)
+        dist_map = 1.0 - cos_sim  # 數值區間被嚴格鎖定在 [0, 2] 之間
+        dist_map = dist_map.view(-1, 16, 16)  # [B, 16, 16]
 
-        # 1. 正常區域 (Normal Loss): 限制 Student 必須與 Teacher 完美貼合
+        # 1. 正常區域 (Normal Loss): 限制 Student 必須與 Teacher 完美貼合（距離趨近於 0）
         normal_mask = (patch_mask == 0).float()
         loss_normal = (dist_map * normal_mask).sum() / (normal_mask.sum() + 1e-6)
 
-        # 2. 合成缺陷區域 (Anomaly Margin Loss): 當遭遇怪異紋理時，強迫 Student 遠離 Teacher
+        # 2. 合成缺陷區域 (Anomaly Margin Loss): 超過 margin 就不處罰，小於 margin 則強力推開
         anomaly_mask = (patch_mask > 0).float()
-        margin = self.config["margin"]
-        # 如果當前特徵距離小於指定的 margin，則施加懲罰項拉開它
+        margin = self.config["margin"]  # 建議在 CONFIG 中將 margin 設為 0.5 左右
         loss_anomaly = (torch.relu(margin - dist_map) * anomaly_mask).sum() / (anomaly_mask.sum() + 1e-6)
 
         # 總損失聯合優化
@@ -145,15 +145,32 @@ class SSPTTLightning(L.LightningModule):
     def predict_step(self, batch, batch_idx: int):
         images, labels, masks, paths = batch
         
+        # 1. 取得 Teacher 與 Student 特徵
         student_tokens, teacher_tokens = self(images)
-        dist_map = torch.norm(teacher_tokens - student_tokens, p=2, dim=-1)
+        
+        # 2. 改用餘弦相似度 (Cosine Similarity)，將距離鎖定在 [0, 2] 區間
+        # F.cosine_similarity 輸出 [-1, 1]，1.0 代表完全相同
+        cos_sim = F.cosine_similarity(student_tokens, teacher_tokens, dim=-1)
+        dist_map = 1.0 - cos_sim  # 越不相似，數值越接近 2.0，完美泛化所有材質！
+        
+        # 重新排列成 2D 特徵圖
         dist_map = dist_map.view(-1, 16, 16).unsqueeze(1)
         
+        # 3. 雙線性插值放大回原圖大小
         anomaly_maps = F.interpolate(dist_map, size=images.shape[2:], mode="bilinear", align_corners=False).squeeze(1)
 
         for sample_idx in range(images.size(0)):
             probs = anomaly_maps[sample_idx].detach().cpu().numpy()
-            probs = gaussian_filter(probs, sigma=4)
+            
+            # 4. 減小高斯平滑核 (Sigma=1.5)，保留布料或細微瑕疵的邊緣細節，防止被抹平
+            probs = gaussian_filter(probs, sigma=1.5)
+
+            # 單圖局部最大/最小值歸一化（有助於跨類別可視化對比）
+            p_min, p_max = probs.min(), probs.max()
+            if p_max - p_min > 1e-5:
+                probs_norm = (probs - p_min) / (p_max - p_min)
+            else:
+                probs_norm = np.zeros_like(probs)
 
             # 影像級評分：取最高的前 1% 異常像素均值
             top_k_pixels = int(probs.size * 0.01)
@@ -169,21 +186,32 @@ class SSPTTLightning(L.LightningModule):
 
             mask_np = masks[sample_idx].squeeze().detach().cpu().numpy()
             mask_bin = (mask_np > 0.5).astype(np.uint8)
+            
+            # 儲存原始餘弦分數用於全域評估，儲存歸一化分數用於繪圖
             self.pixel_scores_all.extend(probs.flatten().tolist())
             self.pixel_labels_all.extend(mask_bin.flatten().tolist())
 
-            # 暫存起來，等整批測試完，拿到全域門檻後再一起畫圖
-            self.all_predicted_maps.append(probs)
+            self.all_predicted_maps.append(probs) # 存原始餘弦分數
             self.all_gt_masks.append(mask_np)
             self.all_metadata.append({
                 "image": images[sample_idx].cpu(),
                 "path": paths[sample_idx],
                 "patch_score": patch_score,
                 "batch_idx": batch_idx,
-                "sample_idx": sample_idx
+                "sample_idx": sample_idx,
+                "probs_norm": probs_norm # 存歸一化分數
             })
 
-    def on_predict_epoch_end(self) -> None:
+    # 這裡改成 on_predict_end，確保預測生命週期完全結束、資料百分之百收集完畢後才執行
+    def on_predict_end(self) -> None:
+        print("\n" + "#"*50)
+        print(f"[DEBUG] on_predict_end 觸發！目前累計收集了 {len(self.all_metadata)} 張圖片的預測結果。")
+        print("#"*50 + "\n")
+
+        if len(self.all_metadata) == 0:
+            print("[WARN] 警告：self.all_metadata 是空的！代表 predict_step 沒有成功存入任何資料。")
+            return
+
         try:
             i_auroc = roc_auc_score(self.image_labels, self.image_scores)
             p_auroc = roc_auc_score(self.pixel_labels_all, self.pixel_scores_all)
@@ -193,23 +221,25 @@ class SSPTTLightning(L.LightningModule):
 
         print(f"\n[SUMMARY] I-AUROC: {i_auroc:.4f} | P-AUROC: {p_auroc:.4f}")
 
-        # --- 核心改動：利用全域正常樣本的分數，找出絕對的黃金分割門檻 ---
-        # 找出所有被標記為「正常 (0)」的圖片的最高像素分數
-        normal_scores = [
-            np.max(self.all_predicted_maps[i]) 
-            for i, label in enumerate(self.image_labels) if label == 0
-        ]
+        # --- 核心改動：改用「全域均值 + 3倍標準差」作為穩健統計門檻 ---
+        normal_pixels = []
+        for i, label in enumerate(self.image_labels):
+            if label == 0:
+                normal_pixels.extend(self.all_predicted_maps[i].flatten())
         
-        if len(normal_scores) > 0:
-            # 絕對門檻設在正常樣本中最高分數的 95% 分位數（稍微容忍雜訊，但絕不亂報警）
-            global_thresh = float(np.percentile(normal_scores, 95))
+        if len(normal_pixels) > 0:
+            normal_pixels = np.array(normal_pixels)
+            mean_val = np.mean(normal_pixels)
+            std_val = np.std(normal_pixels)
+            global_thresh = float(mean_val + 3.0 * std_val)
+            print(f"[THRES] Normal Pixels Stat -> Mean: {mean_val:.4f}, Std: {std_val:.4f}")
         else:
-            # 如果沒有正常樣本當對照組，則取全局分數的 98%
-            global_thresh = float(np.percentile(self.pixel_scores_all, 98))
+            global_thresh = float(np.percentile(self.pixel_scores_all, 95))
             
-        print(f"[THRES] Calculated Global Absolute Threshold: {global_thresh:.4f}")
+        print(f"[THRES] Final Global Robust Threshold: {global_thresh:.4f}")
 
         # --- 統一繪圖輸出 ---
+        print(f"[INFO] 開始繪圖並儲存至: {self.output_path} ...")
         for i, meta in enumerate(self.all_metadata):
             probs = self.all_predicted_maps[i]
             mask_np = self.all_gt_masks[i]
@@ -222,8 +252,9 @@ class SSPTTLightning(L.LightningModule):
             plt.title(f"{defect_type}")
             plt.axis("off")
 
+            # 加上 vmin/vmax 鎖定，避免正常圖被自動放大噪聲
             plt.subplot(1, 4, 2)
-            plt.imshow(probs, cmap="jet")
+            plt.imshow(probs, cmap="jet", vmin=0.0, vmax=0.5)
             plt.title(f"Anomaly Map (Score: {meta['patch_score']:.3f})")
             plt.axis("off")
 
@@ -232,14 +263,17 @@ class SSPTTLightning(L.LightningModule):
             plt.title("GT")
             plt.axis("off")
 
-            # 使用全域絕對門檻！正常圖低於此門檻就會是乾淨的「全黑」，異常圖才會「顯影」
             plt.subplot(1, 4, 4)
             plt.imshow(probs > global_thresh, cmap="gray")
-            plt.title("Predicted Mask (Global Thresh)")
+            plt.title("Predicted Mask (3-Sigma Thresh)")
             plt.axis("off")
 
-            plt.savefig(os.path.join(self.output_path, f"{defect_type}_{meta['batch_idx'] + meta['sample_idx']:03d}.png"))
+            # 儲存圖片
+            save_filename = f"{defect_type}_{meta['batch_idx'] + meta['sample_idx']:03d}.png"
+            plt.savefig(os.path.join(self.output_path, save_filename))
             plt.close()
+            
+        print(f"[INFO] 成功繪製並儲存了 {len(self.all_metadata)} 張圖片！")
 
         with open(os.path.join(self.output_path, "metrics.txt"), "w") as f:
             f.write(f"I-AUROC: {i_auroc}\n")
@@ -363,7 +397,7 @@ if __name__ == "__main__":
     L.seed_everything(CONFIG["seed"], workers=True)
 
     # 針對 T-S 空間最關鍵的排斥邊界 (Margin) 進行優化網格搜索
-    MARGIN_GRID = [0.5, 1.0, 1.5]
+    MARGIN_GRID = [0.4, 0.6]
     all_results = []
 
     for m in MARGIN_GRID:
